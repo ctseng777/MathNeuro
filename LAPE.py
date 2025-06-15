@@ -375,7 +375,7 @@ for repeat in range(0, num_repeats):
             if is_gemma:
                 return gemma_forward
 
-        for i, layer_mask in enumerate(activation_mask[0]):
+        for i, layer_mask in enumerate(activation_mask[2]):
             if is_llama:
                 obj = model.model.layers[i].mlp
             if is_phi:
