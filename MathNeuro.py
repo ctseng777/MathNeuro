@@ -395,7 +395,7 @@ num_samples = args.num_samples
 num_repeats = args.num_repeats
 if args.proportion is None:
     #good_percents = [.0001, .001, .005, .01, .025, .05, .1, .15]
-    good_percents = [.001, .01]
+    good_percents = [0.0001, .001, .01, 0.1]
 if args.proportion is not None:
     good_percents = [args.proportion]
 scalar = args.scalar
