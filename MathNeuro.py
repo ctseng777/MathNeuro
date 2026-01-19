@@ -15,7 +15,7 @@ parser.add_argument('--eval_dataset_size', help="desired number of samples for t
 parser.add_argument('--eval_dataset_subset', help="desired number of samples for task specific eval dataset if subsetting to reduce run time", type = int, default = 100)
 parser.add_argument('--calibration_dataset_names', nargs='+', help="desired name of calibration datasets; should be strings entered in same order as calibration_datasets", type = str)
 parser.add_argument('--num_samples', help="desired number of samples for calculating task specific parameters", type = int, default = 500)
-parser.add_argument('--train_lm_eval_task', help="if your training dataset is an Eleuther AI LM Evaluation Harness task, specify the associated task for the test set.", type = str, default = None)
+parser.add_argument('--train_lm_eval_task', nargs='?', help="if your training dataset is an Eleuther AI LM Evaluation Harness task, specify the associated task for the test set.", type = str, default = None)
 parser.add_argument('--proportion', help="desired proportion of top parameters to calculate", type = float, default = None)
 args = parser.parse_args()
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -27,9 +27,38 @@ import numpy as np
 import re
 import lm_eval
 import json 
+from pathlib import Path
+
+def read_csv_safe(path, random_state=None):
+    df = pd.read_csv(path, engine="python", on_bad_lines="skip")
+    if random_state is None:
+        return df
+    return df.sample(frac=1, random_state=random_state)
+
+
+def build_task_manager(task_names):
+    tasks_root = Path(lm_eval.__file__).resolve().parent / "tasks"
+    task_dirs = set()
+    for name in task_names:
+        if not name:
+            continue
+        if name == "mmlu" or name.startswith("mmlu_"):
+            task_dirs.add(tasks_root / "mmlu")
+        elif name.startswith("gsm8k"):
+            task_dirs.add(tasks_root / "gsm8k")
+        else:
+            candidate = tasks_root / name
+            if candidate.is_dir():
+                task_dirs.add(candidate)
+    if task_dirs:
+        return lm_eval.tasks.TaskManager(
+            include_path=[str(path) for path in sorted(task_dirs)],
+            include_defaults=False,
+        )
+    return lm_eval.tasks.TaskManager()
 
 if 'sgsm' in args.train_dataset:
-    df = pd.read_csv(args.train_dataset) # Load SGSM dataset for few-shot prompting
+    df = read_csv_safe(args.train_dataset) # Load SGSM dataset for few-shot prompting
     df = df[df['subset']=="sgsm_train"] # Subset SGSM to verified training subset
     df = df.sample(frac = 1, random_state = args.random_state)
     for i in range(0, len(df)):
@@ -46,8 +75,7 @@ if 'sgsm' in args.train_dataset:
     val = val.sample(frac = 1, random_state = args.random_state)
 
 if 'sgsm' not in args.train_dataset:
-    train = pd.read_csv(args.train_dataset) # Load SGSM dataset for few-shot prompting
-    train = train.sample(frac = 1, random_state = args.random_state)
+    train = read_csv_safe(args.train_dataset, random_state=args.random_state) # Load SGSM dataset for few-shot prompting
     
 
 calibration_datasets = []
@@ -63,13 +91,19 @@ for dataset in args.calibration_datasets:
 dataset_list = []
 for dataset, dataset_name, name in zip(args.calibration_datasets, calibration_datasets, args.calibration_dataset_names):
     # Load the dataset into a DataFrame
-    globals()[dataset_name] = pd.read_csv(dataset).sample(frac=1, random_state=args.random_state)  # Shuffle the DataFrame
+    globals()[dataset_name] = read_csv_safe(dataset, random_state=args.random_state)  # Shuffle the DataFrame
     
     # Assign a name attribute to the DataFrame
     globals()[dataset_name].name = name
     
     # Append the actual DataFrame object to the list
     dataset_list.append(globals()[dataset_name])
+
+task_manager_names = []
+if args.eval_datasets:
+    task_manager_names.extend(args.eval_datasets)
+if args.train_lm_eval_task:
+    task_manager_names.append(args.train_lm_eval_task)
     
 output_file = f"{args.save_path}/eval_results/{args.model}/{args.text_file}"
 results_path =  f"{args.save_path}/eval_results/{args.model}/"
@@ -143,7 +177,7 @@ if args.pre_train_eval:
     
         with open(output_file, "a") as f:  # Open the file in append mode ("a")
                 f.write(f"Average eval accuracy on {min(args.eval_dataset_subset, len(val))} questions before training with greedy decoding (few-shot): {np.mean(prune_solve)}\n") 
-        task_manager = lm_eval.tasks.TaskManager()
+        task_manager = build_task_manager(task_manager_names)
         #--log_samples --output_path results/phi_15_base --device cuda:0 --batch_size auto:4
         # Setting `task_manager` to the one above is optional and should generally be done
         # if you want to include tasks from paths other than ones in `lm_eval/tasks`.
@@ -162,7 +196,7 @@ if args.pre_train_eval:
             json.dump(results['results'], outfile)
     
     if args.train_lm_eval_task is not None:
-        task_manager = lm_eval.tasks.TaskManager()
+        task_manager = build_task_manager(task_manager_names)
         #--log_samples --output_path results/phi_15_base --device cuda:0 --batch_size auto:4
         # Setting `task_manager` to the one above is optional and should generally be done
         # if you want to include tasks from paths other than ones in `lm_eval/tasks`.
@@ -170,7 +204,7 @@ if args.pre_train_eval:
         results = lm_eval.simple_evaluate( # call simple_evaluate
             model = 'hf',
             model_args = {'pretrained':model, 'dtype': 'bfloat16', 'tokenizer': tokenizer},
-            tasks=args.train_lm_eval_task,
+            tasks=[args.train_lm_eval_task],
             task_manager=task_manager,
             log_samples = False, 
             batch_size = 'auto:4',
@@ -358,9 +392,10 @@ def scale(good_params, factor):
     return prune_params
 
 num_samples = args.num_samples
-num_repeats = 5
+num_repeats = args.num_repeats
 if args.proportion is None:
-    good_percents = [.0001, .001, .005, .01, .025, .05, .1, .15]
+    #good_percents = [.0001, .001, .005, .01, .025, .05, .1, .15]
+    good_percents = [.001, .01]
 if args.proportion is not None:
     good_percents = [args.proportion]
 scalar = args.scalar
@@ -482,7 +517,7 @@ for dataset in dataset_list:
                 with open(output_file, "a") as f:  # Open the file in append mode ("a")
                         f.write(f"Average eval accuracy on {min(args.eval_dataset_subset, len(val))} questions for pruning top {good_percent}% good parameters based on not being activated by {dataset.name} based on {num_samples} training samples and greedy decoding (few-shot): {np.mean(prune_solve)}\n")  
                 torch.cuda.empty_cache()
-                task_manager = lm_eval.tasks.TaskManager()
+                task_manager = build_task_manager(task_manager_names)
                 #--log_samples --output_path results/phi_15_base --device cuda:0 --batch_size auto:4
                 # Setting `task_manager` to the one above is optional and should generally be done
                 # if you want to include tasks from paths other than ones in `lm_eval/tasks`.
@@ -500,7 +535,7 @@ for dataset in dataset_list:
                 with open(results_path, "w") as outfile: 
                     json.dump(results['results'], outfile)
             if args.train_lm_eval_task is not None:
-                task_manager = lm_eval.tasks.TaskManager()
+                task_manager = build_task_manager(task_manager_names)
                 #--log_samples --output_path results/phi_15_base --device cuda:0 --batch_size auto:4
                 # Setting `task_manager` to the one above is optional and should generally be done
                 # if you want to include tasks from paths other than ones in `lm_eval/tasks`.
@@ -508,7 +543,7 @@ for dataset in dataset_list:
                 results = lm_eval.simple_evaluate( # call simple_evaluate
                     model = 'hf',
                     model_args = {'pretrained':model, 'dtype': 'bfloat16', 'tokenizer': tokenizer},
-                    tasks=args.train_lm_eval_task,
+                    tasks=[args.train_lm_eval_task],
                     task_manager=task_manager,
                     log_samples = False, 
                     batch_size = 'auto:4',
