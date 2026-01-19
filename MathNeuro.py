@@ -17,6 +17,19 @@ parser.add_argument('--calibration_dataset_names', nargs='+', help="desired name
 parser.add_argument('--num_samples', help="desired number of samples for calculating task specific parameters", type = int, default = 500)
 parser.add_argument('--train_lm_eval_task', nargs='?', help="if your training dataset is an Eleuther AI LM Evaluation Harness task, specify the associated task for the test set.", type = str, default = None)
 parser.add_argument('--proportion', help="desired proportion of top parameters to calculate", type = float, default = None)
+parser.add_argument('--streetmath_eval', help="run StreetMath evaluation using the current model weights", action="store_true")
+parser.add_argument('--streetmath_jsonl', help="path to StreetMath JSONL file", type = str, default = None)
+parser.add_argument('--streetmath_root', help="path to StreetMathDataset root (contains streetmath_benchmark/ and data/)", type = str, default = None)
+parser.add_argument('--streetmath_limit', help="limit StreetMath samples", type = int, default = None)
+parser.add_argument('--streetmath_max_tokens', help="max new tokens for StreetMath generation", type = int, default = 256)
+parser.add_argument('--streetmath_temperature', help="temperature for StreetMath generation", type = float, default = 0.2)
+parser.add_argument('--streetmath_top_p', help="top_p for StreetMath generation", type = float, default = None)
+parser.add_argument('--streetmath_top_k', help="top_k for StreetMath generation", type = int, default = None)
+parser.add_argument('--streetmath_no_system', help="disable StreetMath system prompt", action="store_true")
+parser.add_argument('--streetmath_custom_system', help="custom StreetMath system prompt text", type = str, default = None)
+parser.add_argument('--streetmath_no_tools', help="disallow tool calls in StreetMath prompts", action="store_true")
+parser.add_argument('--streetmath_hint', help="add StreetMath hint block", action="store_true")
+parser.add_argument('--streetmath_prompt_template_file', help="path to custom StreetMath prompt template", type = str, default = None)
 args = parser.parse_args()
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
@@ -28,6 +41,8 @@ import re
 import lm_eval
 import json 
 from pathlib import Path
+import sys
+import time
 
 def read_csv_safe(path, random_state=None):
     df = pd.read_csv(path, engine="python", on_bad_lines="skip")
@@ -56,6 +71,132 @@ def build_task_manager(task_names):
             include_defaults=False,
         )
     return lm_eval.tasks.TaskManager()
+
+
+def _streetmath_full_prompt(tokenizer, user_prompt, system_prompt):
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": user_prompt})
+    apply = getattr(tokenizer, "apply_chat_template", None)
+    if callable(apply):
+        try:
+            return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        except Exception:
+            pass
+    return (system_prompt + "\n\n" if system_prompt else "") + user_prompt
+
+
+def run_streetmath_eval(model, tokenizer, output_path, args):
+    if args.streetmath_root:
+        streetmath_root = Path(args.streetmath_root).resolve()
+    else:
+        repo_root = Path(__file__).resolve().parents[1]
+        streetmath_root = repo_root / "StreetMathDataset"
+    if str(streetmath_root) not in sys.path:
+        sys.path.insert(0, str(streetmath_root))
+
+    from streetmath_benchmark.loader import load_streetmath
+    from streetmath_benchmark.prompt import build_prompt, DEFAULT_SYSTEM_PROMPT
+    from streetmath_benchmark.eval import build_result_record, summarize
+
+    if args.streetmath_prompt_template_file:
+        try:
+            custom_user = Path(args.streetmath_prompt_template_file).read_text(encoding="utf-8")
+        except Exception:
+            custom_user = None
+    else:
+        custom_user = None
+
+    if args.streetmath_no_system:
+        system_prompt = None
+    else:
+        system_prompt = args.streetmath_custom_system or DEFAULT_SYSTEM_PROMPT
+
+    if args.streetmath_jsonl:
+        streetmath_jsonl = args.streetmath_jsonl
+    else:
+        streetmath_jsonl = str(streetmath_root / "data" / "street_math_test.jsonl")
+
+    samples = load_streetmath(
+        local_jsonl=streetmath_jsonl,
+        split="test",
+        limit=None,
+        shuffle=False,
+        seed=args.random_state,
+    )
+    if args.streetmath_limit is not None:
+        limit = int(args.streetmath_limit)
+        if limit > 0 and len(samples) > limit:
+            stride = max(1, len(samples) // limit)
+            samples = samples[::stride][:limit]
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write("")
+    results = []
+    for sample in samples:
+        user_prompt = build_prompt(
+            sample=sample,
+            custom_instructions=custom_user,
+            disallow_tools=args.streetmath_no_tools,
+            hint=args.streetmath_hint,
+        )
+        full_prompt = _streetmath_full_prompt(tokenizer, user_prompt, system_prompt)
+
+        if getattr(tokenizer, "pad_token", None) is None and getattr(tokenizer, "eos_token", None) is not None:
+            try:
+                tokenizer.pad_token = tokenizer.eos_token
+            except Exception:
+                pass
+
+        start = time.time()
+        tok = tokenizer(full_prompt, return_tensors="pt").to(model.device)
+        gen_kwargs = {
+            **tok,
+            "temperature": args.streetmath_temperature,
+            "max_new_tokens": args.streetmath_max_tokens,
+            "top_p": args.streetmath_top_p,
+            "top_k": args.streetmath_top_k,
+            "do_sample": args.streetmath_temperature > 0,
+        }
+        out = model.generate(**gen_kwargs)
+        elapsed = time.time() - start
+        out_text = tokenizer.decode(out[0], skip_special_tokens=True)
+        prompt_text = tokenizer.decode(tok["input_ids"][0], skip_special_tokens=True)
+        response_text = out_text[len(prompt_text):].strip()
+        usage = {
+            "prompt_tokens": int(tok["input_ids"].shape[-1]),
+            "completion_tokens": int(out[0].shape[-1] - tok["input_ids"].shape[-1]),
+            "total_tokens": int(out[0].shape[-1]),
+            "token_count_source": "tokenizer",
+        }
+
+        rec = build_result_record(
+            sample=sample,
+            provider_name="transformers",
+            model_name=args.model,
+            response_text=response_text,
+            usage=usage,
+            elapsed=elapsed,
+            prompt_text=full_prompt,
+            eval_config={
+                "decoding": {
+                    "temperature": args.streetmath_temperature,
+                    "top_p": args.streetmath_top_p,
+                    "top_k": args.streetmath_top_k,
+                    "max_tokens": args.streetmath_max_tokens,
+                    "seed": args.random_state,
+                },
+            },
+        )
+        results.append(rec)
+        with open(output_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    summary = summarize([r for r in results if "judgement" in r])
+    with open(output_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps({"summary": summary}, ensure_ascii=False) + "\n")
 
 if 'sgsm' in args.train_dataset:
     df = read_csv_safe(args.train_dataset) # Load SGSM dataset for few-shot prompting
@@ -194,6 +335,9 @@ if args.pre_train_eval:
         os.makedirs(os.path.dirname(results_path), exist_ok=True)
         with open(results_path, "w") as outfile: 
             json.dump(results['results'], outfile)
+        if args.streetmath_eval:
+            streetmath_out = f"{args.save_path}/eval_results/{args.model}/STREET_MATH_pre.jsonl"
+            run_streetmath_eval(model, tokenizer, streetmath_out, args)
     
     if args.train_lm_eval_task is not None:
         task_manager = build_task_manager(task_manager_names)
@@ -228,6 +372,9 @@ if args.pre_train_eval:
         os.makedirs(os.path.dirname(results_path), exist_ok=True)
         with open(results_path, "w") as outfile: 
             json.dump(results['results'], outfile)
+        if args.streetmath_eval:
+            streetmath_out = f"{args.save_path}/eval_results/{args.model}/STREET_MATH_pre.jsonl"
+            run_streetmath_eval(model, tokenizer, streetmath_out, args)
             
 magnitude = {}
 def getActivation(name):
@@ -534,6 +681,9 @@ for dataset in dataset_list:
                 os.makedirs(os.path.dirname(results_path), exist_ok=True)
                 with open(results_path, "w") as outfile: 
                     json.dump(results['results'], outfile)
+                if args.streetmath_eval:
+                    streetmath_out = f"{args.save_path}/eval_results/{args.model}/STREET_MATH_{dataset.name}_calculate{good_percent}_run{repeat}.jsonl"
+                    run_streetmath_eval(model, tokenizer, streetmath_out, args)
             if args.train_lm_eval_task is not None:
                 task_manager = build_task_manager(task_manager_names)
                 #--log_samples --output_path results/phi_15_base --device cuda:0 --batch_size auto:4
@@ -567,5 +717,8 @@ for dataset in dataset_list:
                 os.makedirs(os.path.dirname(results_path), exist_ok=True)
                 with open(results_path, "w") as outfile: 
                     json.dump(results['results'], outfile)
+                if args.streetmath_eval:
+                    streetmath_out = f"{args.save_path}/eval_results/{args.model}/STREET_MATH_{dataset.name}_calculate{good_percent}_run{repeat}.jsonl"
+                    run_streetmath_eval(model, tokenizer, streetmath_out, args)
                         
             del model
