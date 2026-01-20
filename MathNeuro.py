@@ -340,7 +340,9 @@ if args.pre_train_eval:
             tasks=args.eval_datasets,
             task_manager=task_manager,
             log_samples = False, 
-            batch_size = 'auto:4'
+            batch_size = 'auto:4',
+            limit = args.eval_dataset_subset,
+            random_seed = args.random_state
         )
         results_path = f"{args.save_path}/eval_results/{args.model}/pre_results.json"
         os.makedirs(os.path.dirname(results_path), exist_ok=True)
@@ -559,8 +561,9 @@ if args.proportion is not None:
 scalar = args.scalar
 for dataset in dataset_list:
     for repeat in range(0, num_repeats):
-        sampled_train = train.sample(n = num_samples, replace = True)
-        sampled_comparison = dataset.sample(n = num_samples, replace = True)
+        run_seed = args.random_state + repeat
+        sampled_train = train.sample(n = num_samples, replace = True, random_state = run_seed)
+        sampled_comparison = dataset.sample(n = num_samples, replace = True, random_state = run_seed)
         for good_percent in good_percents:
             model = AutoModelForCausalLM.from_pretrained(args.model, device_map="auto", torch_dtype=torch.bfloat16)
             torch.cuda.empty_cache()
@@ -690,7 +693,9 @@ for dataset in dataset_list:
                     tasks=args.eval_datasets,
                     task_manager=task_manager,
                     log_samples = False, 
-                    batch_size = 'auto:4'
+                    batch_size = 'auto:4',
+                    limit = args.eval_dataset_subset,
+                    random_seed = run_seed
                 )
                 results_path = f"{args.save_path}/eval_results/{args.model}/{dataset.name}_calculate{good_percent}_run{repeat}.json"
                 os.makedirs(os.path.dirname(results_path), exist_ok=True)
@@ -713,7 +718,7 @@ for dataset in dataset_list:
                     log_samples = False, 
                     batch_size = 'auto:4',
                     limit = args.eval_dataset_subset, 
-                    random_seed = args.random_state
+                    random_seed = run_seed
                 )
                 results_path = f"{args.save_path}/eval_results/{args.model}/{args.train_lm_eval_task}_calculate{good_percent}_run{repeat}_train_task.json"
                 os.makedirs(os.path.dirname(results_path), exist_ok=True)
@@ -726,7 +731,9 @@ for dataset in dataset_list:
                     tasks=args.eval_datasets,
                     task_manager=task_manager,
                     log_samples = False, 
-                    batch_size = 'auto:4'
+                    batch_size = 'auto:4',
+                    limit = args.eval_dataset_subset,
+                    random_seed = run_seed
                 )
                 results_path = f"{args.save_path}/eval_results/{args.model}/{dataset.name}_calculate{good_percent}_run{repeat}.json"
                 os.makedirs(os.path.dirname(results_path), exist_ok=True)
