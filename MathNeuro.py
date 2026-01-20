@@ -560,12 +560,14 @@ if args.proportion is not None:
     good_percents = [args.proportion]
 scalar = args.scalar
 for dataset in dataset_list:
+    model = AutoModelForCausalLM.from_pretrained(args.model, device_map="auto", torch_dtype=torch.bfloat16)
+    base_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
     for repeat in range(0, num_repeats):
         run_seed = args.random_state + repeat
         sampled_train = train.sample(n = num_samples, replace = True, random_state = run_seed)
         sampled_comparison = dataset.sample(n = num_samples, replace = True, random_state = run_seed)
         for good_percent in good_percents:
-            model = AutoModelForCausalLM.from_pretrained(args.model, device_map="auto", torch_dtype=torch.bfloat16)
+            model.load_state_dict(base_state, strict=True)
             torch.cuda.empty_cache()
             magnitude = {}
             def getActivation(name):
@@ -743,4 +745,5 @@ for dataset in dataset_list:
                     streetmath_out = f"{args.save_path}/eval_results/{args.model}/STREET_MATH_calculate{good_percent}_run{repeat}.jsonl"
                     run_streetmath_eval(model, tokenizer, streetmath_out, args)
                         
-            del model
+    del base_state
+    del model
