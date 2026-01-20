@@ -13,6 +13,8 @@ parser.add_argument('--random_state', help="random state for initial dataset shu
 parser.add_argument('--scalar', help="scale factor for top parameters; default is 0 to run pruning experiments", type = float, default = 0)
 parser.add_argument('--eval_dataset_size', help="desired number of samples for task specific eval dataset", type = int, default = None)
 parser.add_argument('--eval_dataset_subset', help="desired number of samples for task specific eval dataset if subsetting to reduce run time", type = int, default = 100)
+parser.add_argument('--train_dataset_size', help="desired number of samples to use from the training dataset CSV", type = int, default = None)
+parser.add_argument('--calibration_dataset_size', help="desired number of samples to use from each calibration dataset CSV", type = int, default = None)
 parser.add_argument('--calibration_dataset_names', nargs='+', help="desired name of calibration datasets; should be strings entered in same order as calibration_datasets", type = str)
 parser.add_argument('--num_samples', help="desired number of samples for calculating task specific parameters", type = int, default = 500)
 parser.add_argument('--train_lm_eval_task', nargs='?', help="if your training dataset is an Eleuther AI LM Evaluation Harness task, specify the associated task for the test set.", type = str, default = None)
@@ -217,6 +219,9 @@ if 'sgsm' in args.train_dataset:
 
 if 'sgsm' not in args.train_dataset:
     train = read_csv_safe(args.train_dataset, random_state=args.random_state) # Load SGSM dataset for few-shot prompting
+
+if args.train_dataset_size is not None:
+    train = train.sample(n=min(args.train_dataset_size, len(train)), random_state=args.random_state)
     
 
 calibration_datasets = []
@@ -233,6 +238,12 @@ dataset_list = []
 for dataset, dataset_name, name in zip(args.calibration_datasets, calibration_datasets, args.calibration_dataset_names):
     # Load the dataset into a DataFrame
     globals()[dataset_name] = read_csv_safe(dataset, random_state=args.random_state)  # Shuffle the DataFrame
+
+    if args.calibration_dataset_size is not None:
+        globals()[dataset_name] = globals()[dataset_name].sample(
+            n=min(args.calibration_dataset_size, len(globals()[dataset_name])),
+            random_state=args.random_state
+        )
     
     # Assign a name attribute to the DataFrame
     globals()[dataset_name].name = name
@@ -597,6 +608,10 @@ for dataset in dataset_list:
                         module._forward_hooks.clear()
         
             remove_hooks(model)
+            if args.streetmath_eval and not args.eval_datasets and args.train_lm_eval_task is None:
+                streetmath_out = f"{args.save_path}/eval_results/{args.model}/STREET_MATH_calculate{good_percent}_run{repeat}.jsonl"
+                os.makedirs(os.path.dirname(streetmath_out), exist_ok=True)
+                run_streetmath_eval(model, tokenizer, streetmath_out, args)
             if 'sgsm' in args.train_dataset:
                 prune_solve = []
                 prune_code = []
