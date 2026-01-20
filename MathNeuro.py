@@ -18,6 +18,7 @@ parser.add_argument('--calibration_dataset_size', help="desired number of sample
 parser.add_argument('--calibration_dataset_names', nargs='+', help="desired name of calibration datasets; should be strings entered in same order as calibration_datasets", type = str)
 parser.add_argument('--num_samples', help="desired number of samples for calculating task specific parameters", type = int, default = 500)
 parser.add_argument('--train_lm_eval_task', nargs='?', help="if your training dataset is an Eleuther AI LM Evaluation Harness task, specify the associated task for the test set.", type = str, default = None)
+parser.add_argument('--train_task_only_pre', help="run train_lm_eval_task only during pre-train eval (skip during pruning runs)", action="store_true")
 parser.add_argument('--proportion', help="desired proportion of top parameters to calculate", type = float, default = None)
 parser.add_argument('--streetmath_eval', help="run StreetMath evaluation using the current model weights", action="store_true")
 parser.add_argument('--streetmath_jsonl', help="path to StreetMath JSONL file", type = str, default = None)
@@ -559,14 +560,17 @@ if args.proportion is None:
 if args.proportion is not None:
     good_percents = [args.proportion]
 scalar = args.scalar
+print(f"[MathNeuro] Loading model once for all datasets: {args.model}")
+model = AutoModelForCausalLM.from_pretrained(args.model, device_map="auto", torch_dtype=torch.bfloat16)
+base_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 for dataset in dataset_list:
-    model = AutoModelForCausalLM.from_pretrained(args.model, device_map="auto", torch_dtype=torch.bfloat16)
-    base_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
     for repeat in range(0, num_repeats):
+        print(f"[MathNeuro] Starting repeat {repeat + 1}/{num_repeats} for dataset={dataset.name}")
         run_seed = args.random_state + repeat
         sampled_train = train.sample(n = num_samples, replace = True, random_state = run_seed)
         sampled_comparison = dataset.sample(n = num_samples, replace = True, random_state = run_seed)
         for good_percent in good_percents:
+            print(f"[MathNeuro] Using proportion={good_percent} for dataset={dataset.name} repeat={repeat}")
             model.load_state_dict(base_state, strict=True)
             torch.cuda.empty_cache()
             magnitude = {}
@@ -684,6 +688,7 @@ for dataset in dataset_list:
                 with open(output_file, "a") as f:  # Open the file in append mode ("a")
                         f.write(f"Average eval accuracy on {min(args.eval_dataset_subset, len(val))} questions for pruning top {good_percent}% good parameters based on not being activated by {dataset.name} based on {num_samples} training samples and greedy decoding (few-shot): {np.mean(prune_solve)}\n")  
                 torch.cuda.empty_cache()
+            if args.eval_datasets:
                 task_manager = build_task_manager(task_manager_names)
                 #--log_samples --output_path results/phi_15_base --device cuda:0 --batch_size auto:4
                 # Setting `task_manager` to the one above is optional and should generally be done
@@ -706,7 +711,7 @@ for dataset in dataset_list:
                 if args.streetmath_eval:
                     streetmath_out = f"{args.save_path}/eval_results/{args.model}/STREET_MATH_calculate{good_percent}_run{repeat}.jsonl"
                     run_streetmath_eval(model, tokenizer, streetmath_out, args)
-            if args.train_lm_eval_task is not None:
+            if args.train_lm_eval_task is not None and not args.train_task_only_pre:
                 task_manager = build_task_manager(task_manager_names)
                 #--log_samples --output_path results/phi_15_base --device cuda:0 --batch_size auto:4
                 # Setting `task_manager` to the one above is optional and should generally be done
@@ -745,5 +750,5 @@ for dataset in dataset_list:
                     streetmath_out = f"{args.save_path}/eval_results/{args.model}/STREET_MATH_calculate{good_percent}_run{repeat}.jsonl"
                     run_streetmath_eval(model, tokenizer, streetmath_out, args)
                         
-    del base_state
-    del model
+del base_state
+del model
