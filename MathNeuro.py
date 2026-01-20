@@ -682,7 +682,7 @@ for dataset in dataset_list:
                 with open(results_path, "w") as outfile: 
                     json.dump(results['results'], outfile)
                 if args.streetmath_eval:
-                    streetmath_out = f"{args.save_path}/eval_results/{args.model}/STREET_MATH_{dataset.name}_calculate{good_percent}_run{repeat}.jsonl"
+                    streetmath_out = f"{args.save_path}/eval_results/{args.model}/STREET_MATH_after_{dataset.name}_calculate{good_percent}_run{repeat}.jsonl"
                     run_streetmath_eval(model, tokenizer, streetmath_out, args)
             if args.train_lm_eval_task is not None:
                 task_manager = build_task_manager(task_manager_names)
@@ -700,7 +700,7 @@ for dataset in dataset_list:
                     limit = args.eval_dataset_subset, 
                     random_seed = args.random_state
                 )
-                results_path = f"{args.save_path}/eval_results/{args.model}/{dataset.name}_calculate{good_percent}_run{repeat}_train_task.json"
+                results_path = f"{args.save_path}/eval_results/{args.model}/{dataset.name}_calculate{good_percent}_run{repeat}_train_task_{args.train_lm_eval_task}.json"
                 os.makedirs(os.path.dirname(results_path), exist_ok=True)
                 with open(results_path, "w") as outfile: 
                     json.dump(results['results'], outfile)
@@ -718,7 +718,7 @@ for dataset in dataset_list:
                 with open(results_path, "w") as outfile: 
                     json.dump(results['results'], outfile)
                 if args.streetmath_eval:
-                    streetmath_out = f"{args.save_path}/eval_results/{args.model}/STREET_MATH_{dataset.name}_calculate{good_percent}_run{repeat}.jsonl"
+                    streetmath_out = f"{args.save_path}/eval_results/{args.model}/STREET_MATH_after_{dataset.name}_calculate{good_percent}_run{repeat}.jsonl"
                     run_streetmath_eval(model, tokenizer, streetmath_out, args)
                         
             del model
