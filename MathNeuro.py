@@ -20,6 +20,7 @@ parser.add_argument('--num_samples', help="desired number of samples for calcula
 parser.add_argument('--eval_batch_size', help="batch size for evaluation and activation collection", type = int, default = 4)
 parser.add_argument('--train_lm_eval_task', nargs='?', help="if your training dataset is an Eleuther AI LM Evaluation Harness task, specify the associated task for the test set.", type = str, default = None)
 parser.add_argument('--train_task_only_pre', help="run train_lm_eval_task only during pre-train eval (skip during pruning runs)", action="store_true")
+parser.add_argument('--skip_train_task_eval', help="skip train_lm_eval_task evaluation entirely", action="store_true")
 parser.add_argument('--proportion', help="desired proportion of top parameters to calculate", type = float, default = None)
 parser.add_argument('--streetmath_eval', help="run StreetMath evaluation using the current model weights", action="store_true")
 parser.add_argument('--streetmath_jsonl', help="path to StreetMath JSONL file", type = str, default = None)
@@ -36,6 +37,7 @@ parser.add_argument('--streetmath_custom_system', help="custom StreetMath system
 parser.add_argument('--streetmath_no_tools', help="disallow tool calls in StreetMath prompts", action="store_true")
 parser.add_argument('--streetmath_hint', help="add StreetMath hint block", action="store_true")
 parser.add_argument('--streetmath_prompt_template_file', help="path to custom StreetMath prompt template", type = str, default = None)
+parser.add_argument('--resume', help="skip runs where all expected eval outputs already exist", action="store_true")
 args = parser.parse_args()
 if not args.eval_datasets and not args.train_lm_eval_task and not args.streetmath_eval:
     auto_eval = None
@@ -704,6 +706,22 @@ for dataset in dataset_list:
         for good_percent in good_percents:
             log_print(f"Using proportion={good_percent} for dataset={dataset.name} repeat={repeat}")
             log_ts(f"prune_start proportion={good_percent} repeat={repeat}")
+            results_dir = f"{args.save_path}/eval_results/{args.model}"
+            eval_results_path = f"{results_dir}/{dataset.name}_calculate{good_percent}_run{repeat}.json"
+            streetmath_out = f"{results_dir}/STREET_MATH_calculate{good_percent}_run{repeat}.jsonl"
+            train_task_out = f"{results_dir}/{args.train_lm_eval_task}_calculate{good_percent}_run{repeat}_train_task.json"
+            expected_outputs = []
+            if args.eval_datasets:
+                expected_outputs.append(eval_results_path)
+            if args.streetmath_eval:
+                expected_outputs.append(streetmath_out)
+            if args.train_lm_eval_task is not None and not args.train_task_only_pre and not args.skip_train_task_eval:
+                expected_outputs.append(train_task_out)
+            if args.resume and expected_outputs and all(os.path.exists(p) for p in expected_outputs):
+                log_print(
+                    f"Skipping proportion={good_percent} repeat={repeat} for dataset={dataset.name} (all outputs exist)"
+                )
+                continue
             model.load_state_dict(base_state, strict=True)
             torch.cuda.empty_cache()
             magnitude = {}
@@ -834,50 +852,12 @@ for dataset in dataset_list:
                         f.write(f"Average eval accuracy on {min(args.eval_dataset_subset, len(val))} questions for pruning top {good_percent}% good parameters based on not being activated by {dataset.name} based on {num_samples} training samples and greedy decoding (few-shot): {np.mean(prune_solve)}\n")  
                 torch.cuda.empty_cache()
             if args.eval_datasets:
-                task_manager = build_task_manager(task_manager_names)
-                #--log_samples --output_path results/phi_15_base --device cuda:0 --batch_size auto:4
-                # Setting `task_manager` to the one above is optional and should generally be done
-                # if you want to include tasks from paths other than ones in `lm_eval/tasks`.
-                # `simple_evaluate` will instantiate its own task_manager if it is set to None here.
-                eval_tasks, eval_limit = resolve_mmlu_eval_tasks(args.eval_datasets, args.eval_dataset_subset, run_seed)
-                results = lm_eval.simple_evaluate( # call simple_evaluate
-                    model = 'hf',
-                    model_args = {'pretrained':model, 'dtype': 'bfloat16', 'tokenizer': tokenizer},
-                    tasks=eval_tasks,
-                    task_manager=task_manager,
-                    log_samples = False, 
-                    batch_size = args.eval_batch_size,
-                    limit = eval_limit,
-                    random_seed = run_seed
-                )
-                results_path = f"{args.save_path}/eval_results/{args.model}/{dataset.name}_calculate{good_percent}_run{repeat}.json"
-                os.makedirs(os.path.dirname(results_path), exist_ok=True)
-                with open(results_path, "w") as outfile: 
-                    json.dump(results['results'], outfile)
-                if args.streetmath_eval:
-                    streetmath_out = f"{args.save_path}/eval_results/{args.model}/STREET_MATH_calculate{good_percent}_run{repeat}.jsonl"
-                    run_streetmath_eval(model, tokenizer, streetmath_out, args)
-            if args.train_lm_eval_task is not None and not args.train_task_only_pre:
-                task_manager = build_task_manager(task_manager_names)
-                #--log_samples --output_path results/phi_15_base --device cuda:0 --batch_size auto:4
-                # Setting `task_manager` to the one above is optional and should generally be done
-                # if you want to include tasks from paths other than ones in `lm_eval/tasks`.
-                # `simple_evaluate` will instantiate its own task_manager if it is set to None here.
-                results = lm_eval.simple_evaluate( # call simple_evaluate
-                    model = 'hf',
-                    model_args = {'pretrained':model, 'dtype': 'bfloat16', 'tokenizer': tokenizer},
-                    tasks=[args.train_lm_eval_task],
-                    task_manager=task_manager,
-                    log_samples = False, 
-                    batch_size = args.eval_batch_size,
-                    limit = args.eval_dataset_subset, 
-                    random_seed = run_seed
-                )
-                results_path = f"{args.save_path}/eval_results/{args.model}/{args.train_lm_eval_task}_calculate{good_percent}_run{repeat}_train_task.json"
-                os.makedirs(os.path.dirname(results_path), exist_ok=True)
-                with open(results_path, "w") as outfile: 
-                    json.dump(results['results'], outfile)
-                    
+                if not (args.resume and os.path.exists(eval_results_path)):
+                    task_manager = build_task_manager(task_manager_names)
+                    #--log_samples --output_path results/phi_15_base --device cuda:0 --batch_size auto:4
+                    # Setting `task_manager` to the one above is optional and should generally be done
+                    # if you want to include tasks from paths other than ones in `lm_eval/tasks`.
+                    # `simple_evaluate` will instantiate its own task_manager if it is set to None here.
                     eval_tasks, eval_limit = resolve_mmlu_eval_tasks(args.eval_datasets, args.eval_dataset_subset, run_seed)
                     results = lm_eval.simple_evaluate( # call simple_evaluate
                         model = 'hf',
@@ -889,13 +869,38 @@ for dataset in dataset_list:
                         limit = eval_limit,
                         random_seed = run_seed
                     )
-                results_path = f"{args.save_path}/eval_results/{args.model}/{dataset.name}_calculate{good_percent}_run{repeat}.json"
-                os.makedirs(os.path.dirname(results_path), exist_ok=True)
-                with open(results_path, "w") as outfile: 
-                    json.dump(results['results'], outfile)
+                    os.makedirs(os.path.dirname(eval_results_path), exist_ok=True)
+                    with open(eval_results_path, "w") as outfile: 
+                        json.dump(results['results'], outfile)
+                else:
+                    log_print(f"Skipping eval_datasets (results exist): {eval_results_path}")
                 if args.streetmath_eval:
-                    streetmath_out = f"{args.save_path}/eval_results/{args.model}/STREET_MATH_calculate{good_percent}_run{repeat}.jsonl"
-                    run_streetmath_eval(model, tokenizer, streetmath_out, args)
+                    if not (args.resume and os.path.exists(streetmath_out)):
+                        run_streetmath_eval(model, tokenizer, streetmath_out, args)
+                    else:
+                        log_print(f"Skipping StreetMath (results exist): {streetmath_out}")
+            if args.train_lm_eval_task is not None and not args.train_task_only_pre and not args.skip_train_task_eval:
+                task_manager = build_task_manager(task_manager_names)
+                #--log_samples --output_path results/phi_15_base --device cuda:0 --batch_size auto:4
+                # Setting `task_manager` to the one above is optional and should generally be done
+                # if you want to include tasks from paths other than ones in `lm_eval/tasks`.
+                # `simple_evaluate` will instantiate its own task_manager if it is set to None here.
+                if not (args.resume and os.path.exists(train_task_out)):
+                    results = lm_eval.simple_evaluate( # call simple_evaluate
+                        model = 'hf',
+                        model_args = {'pretrained':model, 'dtype': 'bfloat16', 'tokenizer': tokenizer},
+                        tasks=[args.train_lm_eval_task],
+                        task_manager=task_manager,
+                        log_samples = False, 
+                        batch_size = args.eval_batch_size,
+                        limit = args.eval_dataset_subset, 
+                        random_seed = run_seed
+                    )
+                    os.makedirs(os.path.dirname(train_task_out), exist_ok=True)
+                    with open(train_task_out, "w") as outfile: 
+                        json.dump(results['results'], outfile)
+                else:
+                    log_print(f"Skipping train task eval (results exist): {train_task_out}")
                         
 del base_state
 del model
