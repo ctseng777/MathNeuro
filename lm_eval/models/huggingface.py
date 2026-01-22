@@ -908,7 +908,10 @@ class HFLM(TemplateLM):
         return loglikelihoods
 
     def _batch_scheduler(self, pos, n_reordered_requests):
-        sched = pos // int(len(n_reordered_requests) / self.batch_schedule)
+        denom = int(len(n_reordered_requests) / self.batch_schedule)
+        if denom <= 0:
+            denom = 1
+        sched = pos // denom
         if sched in self.batch_sizes:
             return self.batch_sizes[sched]
         if (len(self.batch_sizes) > 1) and (
