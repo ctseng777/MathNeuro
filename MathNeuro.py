@@ -38,6 +38,7 @@ parser.add_argument('--streetmath_no_tools', help="disallow tool calls in Street
 parser.add_argument('--streetmath_hint', help="add StreetMath hint block", action="store_true")
 parser.add_argument('--streetmath_prompt_template_file', help="path to custom StreetMath prompt template", type = str, default = None)
 parser.add_argument('--resume', help="skip runs where all expected eval outputs already exist", action="store_true")
+parser.add_argument('--trust_remote_code', help="allow custom model/tokenizer code from Hugging Face", action="store_true")
 args = parser.parse_args()
 if not args.eval_datasets and not args.train_lm_eval_task and not args.streetmath_eval:
     auto_eval = None
@@ -48,7 +49,7 @@ if not args.eval_datasets and not args.train_lm_eval_task and not args.streetmat
         if args.eval_dataset_subset is None or args.eval_dataset_subset > 1:
             args.eval_dataset_subset = 1
         print(f"[MathNeuro] Auto-eval enabled: eval_datasets={args.eval_datasets} eval_dataset_subset={args.eval_dataset_subset}")
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -196,16 +197,30 @@ def run_streetmath_eval(model, tokenizer, output_path, args):
 
         start = time.time()
         tok = tokenizer(full_prompts, return_tensors="pt", padding=True).to(model.device)
-        gen_kwargs = {
-            **tok,
-            "temperature": args.streetmath_temperature,
-            "max_new_tokens": args.streetmath_max_tokens,
-            "top_p": args.streetmath_top_p,
-            "top_k": args.streetmath_top_k,
-            "do_sample": args.streetmath_temperature > 0,
-        }
+        model_type = str(getattr(getattr(model, "config", None), "model_type", "")).lower()
         with torch.no_grad():
-            out = model.generate(**gen_kwargs)
+            if model_type == "dream" and hasattr(model, "diffusion_generate"):
+                gen_kwargs = {
+                    "inputs": tok["input_ids"],
+                    "attention_mask": tok.get("attention_mask"),
+                    "temperature": args.streetmath_temperature,
+                    "max_new_tokens": args.streetmath_max_tokens,
+                    "top_p": args.streetmath_top_p,
+                    "top_k": args.streetmath_top_k,
+                }
+                out = model.diffusion_generate(**gen_kwargs)
+                out = out.sequences if hasattr(out, "sequences") else out
+            else:
+                tok = normalize_attention_mask(tok, model)
+                gen_kwargs = {
+                    **tok,
+                    "temperature": args.streetmath_temperature,
+                    "max_new_tokens": args.streetmath_max_tokens,
+                    "top_p": args.streetmath_top_p,
+                    "top_k": args.streetmath_top_k,
+                    "do_sample": args.streetmath_temperature > 0,
+                }
+                out = model.generate(**gen_kwargs)
         elapsed = time.time() - start
         for i, sample in enumerate(batch):
             prompt_tokens = int(tok["attention_mask"][i].sum().item())
@@ -322,36 +337,150 @@ def log_print(message):
     print(f"[{ts}] {message}")
     log_ts(message)
 
+def normalize_attention_mask(batch, model):
+    attn = batch.get("attention_mask")
+    if attn is None:
+        return batch
+    model_type = str(getattr(getattr(model, "config", None), "model_type", "")).lower()
+    if model_type == "dream" and attn.dim() == 2:
+        attn = attn.to(dtype=model.dtype)
+        attn = (1.0 - attn) * torch.finfo(attn.dtype).min
+        batch["attention_mask"] = attn[:, None, None, :]
+        return batch
+    if attn.dtype not in (torch.bool, torch.float16, torch.float32, torch.bfloat16):
+        batch["attention_mask"] = attn.bool()
+    return batch
+
 log_ts("run_start")
 log_print("run_start")
 
+tokenizer = None
 try:
-    tokenizer = AutoTokenizer.from_pretrained(args.model, local_files_only=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model,
+        local_files_only=True,
+        trust_remote_code=args.trust_remote_code,
+    )
     log_print(f"Loaded tokenizer from local cache: {args.model}")
 except Exception:
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model,
+        trust_remote_code=args.trust_remote_code,
+    )
     log_print(f"Loaded tokenizer (remote fallback): {args.model}")
+if getattr(tokenizer, "pad_token", None) is None and getattr(tokenizer, "eos_token", None) is not None:
+    try:
+        tokenizer.pad_token = tokenizer.eos_token
+    except Exception:
+        pass
+if getattr(tokenizer, "padding_side", None) != "left":
+    tokenizer.padding_side = "left"
+
+config = None
+try:
+    config = AutoConfig.from_pretrained(
+        args.model,
+        trust_remote_code=args.trust_remote_code,
+    )
+except Exception as e:
+    log_print(f"Config load failed (will rely on model load): {e}")
+
+if config is not None and str(getattr(config, "model_type", "")).lower() == "dream":
+    try:
+        from transformers.dynamic_module_utils import get_class_from_dynamic_module
+        import importlib
+        import inspect
+        from transformers import PreTrainedModel
+
+        auto_map = getattr(config, "auto_map", {}) or {}
+        model_ref = auto_map.get("AutoModel")
+        if model_ref:
+            dream_model_cls = get_class_from_dynamic_module(
+                model_ref,
+                args.model,
+                trust_remote_code=args.trust_remote_code,
+            )
+            AutoModelForCausalLM.register(config.__class__, dream_model_cls)
+            log_print("Registered Dream model with AutoModelForCausalLM.")
+            module = importlib.import_module(dream_model_cls.__module__)
+            dream_pretrained_cls = getattr(module, "DreamPreTrainedModel", None)
+            dream_gen_config = getattr(module, "DreamGenerationConfig", None)
+            if dream_pretrained_cls and "weights_only" not in inspect.signature(PreTrainedModel.from_pretrained).parameters:
+                def _dream_from_pretrained_patched(cls, pretrained_model_name_or_path, *model_args, **kwargs):
+                    kwargs.pop("weights_only", None)
+                    model = PreTrainedModel.from_pretrained.__func__(
+                        cls, pretrained_model_name_or_path, *model_args, **kwargs
+                    )
+                    if dream_gen_config is not None:
+                        model.generation_config = dream_gen_config.from_pretrained(
+                            pretrained_model_name_or_path,
+                            cache_dir=kwargs.get("cache_dir"),
+                            force_download=kwargs.get("force_download", False),
+                            resume_download=kwargs.get("resume_download", None),
+                            proxies=kwargs.get("proxies", None),
+                            local_files_only=kwargs.get("local_files_only", False),
+                            token=kwargs.get("token", None),
+                            revision=kwargs.get("revision", "main"),
+                            subfolder=kwargs.get("subfolder", ""),
+                            _from_auto=kwargs.get("_from_auto", False),
+                            _from_pipeline=kwargs.get("_from_pipeline", None),
+                        )
+                    return model
+                dream_pretrained_cls.from_pretrained = classmethod(_dream_from_pretrained_patched)
+                log_print("Patched Dream from_pretrained to skip unsupported weights_only.")
+    except Exception as e:
+        log_print(f"Dream model registration failed: {e}")
+
+model = None
+load_kwargs = dict(
+    device_map="auto",
+    low_cpu_mem_usage=True,
+    trust_remote_code=args.trust_remote_code,
+)
 try:
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
-        device_map="auto",
         torch_dtype=torch.bfloat16,
-        low_cpu_mem_usage=True,
         local_files_only=True,
+        config=config,
+        **load_kwargs,
     )
     log_print(f"Loaded model from local cache: {args.model}")
 except Exception:
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model,
-        device_map="auto",
-        torch_dtype=torch.bfloat16,
-        low_cpu_mem_usage=True,
-    )
-    log_print(f"Loaded model (remote fallback): {args.model}")
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model,
+            torch_dtype=torch.bfloat16,
+            config=config,
+            **load_kwargs,
+        )
+        log_print(f"Loaded model (remote fallback): {args.model}")
+    except Exception:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model,
+            torch_dtype=torch.float16,
+            config=config,
+            **load_kwargs,
+        )
+        log_print(f"Loaded model with float16 fallback: {args.model}")
 model.eval()
 torch.set_grad_enabled(False)
 if hasattr(model, "config"):
     model.config.use_cache = True
+if str(getattr(getattr(model, "config", None), "model_type", "")).lower() == "dream":
+    import functools
+    import inspect
+
+    _dream_forward = model.forward
+    @functools.wraps(_dream_forward)
+    def _dream_forward_patched(*args, **kwargs):
+        attn = kwargs.get("attention_mask", None)
+        if isinstance(attn, torch.Tensor) and attn.dim() == 2:
+            mask = attn.to(dtype=model.dtype)
+            mask = (1.0 - mask) * torch.finfo(mask.dtype).min
+            kwargs["attention_mask"] = mask[:, None, None, :]
+        return _dream_forward(*args, **kwargs)
+    model.forward = _dream_forward_patched
 if args.pre_train_eval:
     if 'sgsm' in args.train_dataset:
         prune_solve = []
@@ -527,6 +656,7 @@ if 'bad_gens_full.csv' in args.calibration_datasets:
                 max_length=256,
                 padding=True,
             ).to(model.device)
+            inputs = normalize_attention_mask(inputs, model)
             with torch.no_grad():
                 _ = model(**inputs, use_cache=False)
             for key, tensor in magnitude.items():
@@ -609,6 +739,7 @@ def find_good_params(model, train, keep_ratio, prune = True, largest = True, num
             max_length=256,
             padding=True,
         ).to(model.device)
+        inputs = normalize_attention_mask(inputs, model)
         with torch.no_grad():
             _ = model(**inputs, use_cache=False)
         for key, tensor in magnitude.items():
